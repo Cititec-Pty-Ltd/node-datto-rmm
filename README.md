@@ -1,3 +1,6 @@
+> **Cititec fork** of [WYRE-AI/node-datto-rmm](https://github.com/WYRE-AI/node-datto-rmm). Before changing anything, read
+> [CITITEC-FORK.md](CITITEC-FORK.md): which changes go back to Wyre and which stay in this fork.
+
 # node-datto-rmm
 
 Comprehensive, fully-typed Node.js/TypeScript library for the Datto RMM API v2.
