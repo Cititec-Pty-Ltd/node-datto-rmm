@@ -158,12 +158,15 @@ try {
   if (error instanceof DattoRmmNotFoundError) {
     console.log('Device not found');
   } else if (error instanceof DattoRmmRateLimitError) {
-    console.log('Rate limited, retry after:', error.retryAfter);
+    // Not retried by the client: Datto blocks the IP (403) when calls continue after a 429.
+    console.log('Rate limited, retry after (ms):', error.retryAfter);
   } else if (error instanceof DattoRmmIpBlockedError) {
     console.log('IP blocked for 5 minutes');
   }
 }
 ```
+
+A 429 is never retried by the client: Datto RMM blocks the source IP with a 403 (about 5 minutes) when requests continue after one. The error message says `HTTP 429` and `Try again in N s.` (the `Retry-After` Datto sends, or 60 s). A 403 that is an IP block, or that follows a 429 within the block window, becomes `DattoRmmIpBlockedError` (`HTTP 403`, `Try again in N s.`), and later requests fail locally until the block has passed. `rateLimit.maxRetries` and `rateLimit.retryAfterMs` no longer apply.
 
 ## License
 

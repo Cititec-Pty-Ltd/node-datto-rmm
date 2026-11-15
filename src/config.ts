@@ -39,9 +39,16 @@ export interface RateLimitConfig {
   windowMs: number;
   /** Threshold percentage to start throttling (default: 0.8 = 80%) */
   throttleThreshold: number;
-  /** Delay between retries on 429 (default: 5000ms) */
+  /**
+   * Delay between retries on 429 (default: 5000ms).
+   * @deprecated HttpClient no longer retries a 429; see maxRetries.
+   */
   retryAfterMs: number;
-  /** Maximum retry attempts on rate limit errors (default: 3) */
+  /**
+   * Maximum retry attempts on rate limit errors (default: 3).
+   * @deprecated HttpClient no longer retries a 429: Datto blocks the source
+   * IP (403) when calls continue after one. Kept for compatibility.
+   */
   maxRetries: number;
   /** Cooldown duration when IP is blocked (default: 300000ms = 5 minutes) */
   ipBlockCooldownMs: number;
