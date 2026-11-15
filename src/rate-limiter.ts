@@ -104,6 +104,14 @@ export class RateLimiter {
   }
 
   /**
+   * Forget the last 429 once a request succeeds: the API is answering again,
+   * so a later 403 is an ordinary permission error, not proof of an IP block.
+   */
+  handleSuccess(): void {
+    this.lastRateLimitedAt = null;
+  }
+
+  /**
    * Handle an IP block error (403)
    */
   handleIpBlock(): void {

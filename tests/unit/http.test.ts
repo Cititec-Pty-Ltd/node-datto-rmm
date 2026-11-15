@@ -242,6 +242,26 @@ describe('HttpClient rate-limit handling (429 is never retried)', () => {
     expect((refused as Error).message).toMatch(/HTTP 403.*not sent.*Try again in \d+ s\./);
   });
 
+  it('treats a 403 after 429 then 200 as a plain permission error, not an IP block', async () => {
+    const client = makeClient();
+    vi.mocked(fetch).mockResolvedValueOnce(limited('5'));
+    await client.request('/account/sites').catch(() => undefined);
+
+    vi.mocked(fetch).mockResolvedValueOnce(realResponse('[]'));
+    await expect(client.request('/account/sites')).resolves.toEqual([]);
+
+    vi.mocked(fetch).mockResolvedValueOnce(
+      realResponse(JSON.stringify({ message: 'No access to this site' }), { status: 403 })
+    );
+    const err = await client.request('/account/sites').catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(DattoRmmForbiddenError);
+
+    // No local block: the next request is sent.
+    vi.mocked(fetch).mockResolvedValueOnce(realResponse('[]'));
+    await expect(client.request('/account/sites')).resolves.toEqual([]);
+    expect(fetch).toHaveBeenCalledTimes(4);
+  });
+
   it('keeps a plain 403 without a recent 429 as DattoRmmForbiddenError', async () => {
     vi.mocked(fetch).mockResolvedValue(realResponse(JSON.stringify({ message: 'No access' }), { status: 403 }));
     const err = await makeClient()

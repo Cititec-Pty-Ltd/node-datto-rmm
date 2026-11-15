@@ -154,6 +154,7 @@ export class HttpClient {
     }
 
     if (response.ok) {
+      this.rateLimiter.handleSuccess();
       if (bodyIsJson) {
         return parsedBody as T;
       }
