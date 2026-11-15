@@ -18,6 +18,7 @@ export class RateLimiter {
   private readonly config: RateLimitConfig;
   private requestTimestamps: number[] = [];
   private ipBlockedUntil: number | null = null;
+  private lastRateLimitedAt: number | null = null;
 
   constructor(config: RateLimitConfig) {
     this.config = config;
@@ -38,7 +39,8 @@ export class RateLimiter {
       if (now < this.ipBlockedUntil) {
         const remainingMs = this.ipBlockedUntil - now;
         throw new DattoRmmIpBlockedError(
-          `IP is blocked for ${Math.ceil(remainingMs / 1000)} more seconds`,
+          `Datto RMM blocked this IP after rate-limit violations (HTTP 403 Forbidden); this request was not sent. ` +
+            `Try again in ${Math.ceil(remainingMs / 1000)} s.`,
           remainingMs
         );
       }
@@ -89,8 +91,24 @@ export class RateLimiter {
    * Handle a rate limit error (429)
    */
   handleRateLimitError(_retryCount: number): void {
-    // The rate limiter itself doesn't need to do much here,
-    // but we track that we're getting rate limited
+    // Remembered so a 403 that follows soon after is read as an IP block.
+    this.lastRateLimitedAt = Date.now();
+  }
+
+  /**
+   * True when a 429 was seen within the IP-block cooldown. Datto answers 403
+   * (IP blocked) when calls continue after a 429.
+   */
+  wasRecentlyRateLimited(): boolean {
+    return this.lastRateLimitedAt !== null && Date.now() - this.lastRateLimitedAt < this.config.ipBlockCooldownMs;
+  }
+
+  /**
+   * Forget the last 429 once a request succeeds: the API is answering again,
+   * so a later 403 is an ordinary permission error, not proof of an IP block.
+   */
+  handleSuccess(): void {
+    this.lastRateLimitedAt = null;
   }
 
   /**
@@ -141,7 +159,9 @@ export class RateLimiter {
   }
 
   /**
-   * Check if we should retry after a rate limit error
+   * Check if we should retry after a rate limit error.
+   * HttpClient no longer retries a 429 (Datto blocks the IP when calls
+   * continue after one); kept for API compatibility.
    */
   shouldRetry(retryCount: number): boolean {
     return retryCount < this.config.maxRetries;
