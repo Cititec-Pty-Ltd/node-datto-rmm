@@ -1,3 +1,19 @@
+## [Unreleased]
+
+### Fixed
+
+- A 429 is no longer retried. Datto RMM blocks the source IP with a 403 (about 5 minutes) when requests continue after a 429, and the client used to retry up to three times.
+- A 403 within the IP-block window after a 429 is reported as `DattoRmmIpBlockedError`, and later requests fail locally until the block has passed. The marker is cleared only by a successful JSON or empty response to a request sent after the last 429, so a rejected 2xx (for example an HTML challenge page) or an older request finishing late does not end the protection.
+
+### Changed
+
+- `DattoRmmRateLimitError` reads `Datto RMM rate-limited the request (HTTP 429 Too Many Requests). Not retried: … Try again in N s.`, and `retryAfter` (ms) comes from `Retry-After` (seconds or HTTP date), or 60 s without one.
+- `DattoRmmIpBlockedError` reads `Datto RMM blocked this IP after rate-limit violations (HTTP 403 Forbidden). Try again in N s.`; a request refused locally during the block says it was not sent.
+
+### Deprecated
+
+- `rateLimit.maxRetries` and `rateLimit.retryAfterMs`: a 429 is never retried, so they no longer apply. Kept for compatibility.
+
 ## [2.0.2](https://github.com/WYRE-AI/node-datto-rmm/compare/v2.0.1...v2.0.2) (2026-10-13)
 
 

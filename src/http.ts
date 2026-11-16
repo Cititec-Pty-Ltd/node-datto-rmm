@@ -114,6 +114,9 @@ export class HttpClient {
 
     // Record the request
     this.rateLimiter.recordRequest();
+    // A success only clears the recent-429 marker if no 429 arrived after
+    // this request was sent.
+    const rateLimitGeneration = this.rateLimiter.currentRateLimitGeneration();
 
     // Make the request
     const response = await fetch(url, {
@@ -123,7 +126,16 @@ export class HttpClient {
     });
 
     // Handle the response
-    return this.handleResponse<T>(response, url, method, body, skipAuth, retryCount, isRetryAfter401);
+    return this.handleResponse<T>(
+      response,
+      url,
+      method,
+      body,
+      skipAuth,
+      retryCount,
+      isRetryAfter401,
+      rateLimitGeneration
+    );
   }
 
   /**
@@ -136,7 +148,8 @@ export class HttpClient {
     body: unknown,
     skipAuth: boolean,
     retryCount: number,
-    isRetryAfter401: boolean
+    isRetryAfter401: boolean,
+    rateLimitGeneration: number
   ): Promise<T> {
     // Read the body EXACTLY once, as text, for every path. A fetch Response
     // body is a one-shot stream: response.json() followed by response.text()
@@ -154,12 +167,15 @@ export class HttpClient {
     }
 
     if (response.ok) {
-      this.rateLimiter.handleSuccess();
+      // Only a response we accept marks recovery from a 429. A 2xx that is
+      // rejected below (an HTML challenge or login page) does not.
       if (bodyIsJson) {
+        this.rateLimiter.handleSuccess(rateLimitGeneration);
         return parsedBody as T;
       }
       if (rawBody.trim() === '') {
         // Genuinely empty 200/204 — preserve the historical empty-object shape.
+        this.rateLimiter.handleSuccess(rateLimitGeneration);
         return {} as T;
       }
       // A 200 whose body isn't JSON is not a success we can use (login pages,

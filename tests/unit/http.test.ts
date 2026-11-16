@@ -242,6 +242,47 @@ describe('HttpClient rate-limit handling (429 is never retried)', () => {
     expect((refused as Error).message).toMatch(/HTTP 403.*not sent.*Try again in \d+ s\./);
   });
 
+  it('does not treat a rejected 2xx (HTML challenge) after a 429 as recovery', async () => {
+    const client = makeClient();
+    vi.mocked(fetch).mockResolvedValueOnce(limited('5'));
+    await client.request('/account/sites').catch(() => undefined);
+
+    vi.mocked(fetch).mockResolvedValueOnce(
+      new Response('<html>challenge</html>', { status: 200, headers: { 'content-type': 'text/html' } })
+    );
+    const challenge = await client.request('/account/sites').catch((e: unknown) => e);
+    expect(challenge).toBeInstanceOf(DattoRmmError);
+
+    vi.mocked(fetch).mockResolvedValueOnce(
+      realResponse(JSON.stringify({ message: 'Forbidden' }), { status: 403 })
+    );
+    const blocked = await client.request('/account/sites').catch((e: unknown) => e);
+    expect(blocked).toBeInstanceOf(DattoRmmIpBlockedError);
+  });
+
+  it('does not let an older request that succeeds late clear a newer 429', async () => {
+    const client = makeClient();
+    let finishOlder: (res: Response) => void = () => undefined;
+    vi.mocked(fetch).mockImplementationOnce(
+      () => new Promise<Response>((resolve) => (finishOlder = resolve))
+    );
+    const older = client.request('/account/sites');
+    // Let the older request reach fetch() before the newer one is answered.
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
+
+    vi.mocked(fetch).mockResolvedValueOnce(limited('5'));
+    await client.request('/account/devices').catch(() => undefined);
+
+    finishOlder(realResponse('[]'));
+    await expect(older).resolves.toEqual([]);
+
+    vi.mocked(fetch).mockResolvedValueOnce(
+      realResponse(JSON.stringify({ message: 'Forbidden' }), { status: 403 })
+    );
+    const blocked = await client.request('/account/sites').catch((e: unknown) => e);
+    expect(blocked).toBeInstanceOf(DattoRmmIpBlockedError);
+  });
+
   it('treats a 403 after 429 then 200 as a plain permission error, not an IP block', async () => {
     const client = makeClient();
     vi.mocked(fetch).mockResolvedValueOnce(limited('5'));

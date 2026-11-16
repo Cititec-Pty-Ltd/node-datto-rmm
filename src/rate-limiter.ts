@@ -19,6 +19,8 @@ export class RateLimiter {
   private requestTimestamps: number[] = [];
   private ipBlockedUntil: number | null = null;
   private lastRateLimitedAt: number | null = null;
+  /** Bumped on every 429, so a success can tell whether a newer 429 came after it was sent. */
+  private rateLimitGeneration = 0;
 
   constructor(config: RateLimitConfig) {
     this.config = config;
@@ -93,6 +95,15 @@ export class RateLimiter {
   handleRateLimitError(_retryCount: number): void {
     // Remembered so a 403 that follows soon after is read as an IP block.
     this.lastRateLimitedAt = Date.now();
+    this.rateLimitGeneration++;
+  }
+
+  /**
+   * The current rate-limit generation. Read it when a request is sent and
+   * pass it to handleSuccess() when that request succeeds.
+   */
+  currentRateLimitGeneration(): number {
+    return this.rateLimitGeneration;
   }
 
   /**
@@ -106,9 +117,14 @@ export class RateLimiter {
   /**
    * Forget the last 429 once a request succeeds: the API is answering again,
    * so a later 403 is an ordinary permission error, not proof of an IP block.
+   * `sentAtGeneration` is currentRateLimitGeneration() when that request was
+   * sent. If a 429 arrived after it was sent, the success says nothing about
+   * recovery from that newer 429, so the marker is kept.
    */
-  handleSuccess(): void {
-    this.lastRateLimitedAt = null;
+  handleSuccess(sentAtGeneration: number): void {
+    if (sentAtGeneration === this.rateLimitGeneration) {
+      this.lastRateLimitedAt = null;
+    }
   }
 
   /**
