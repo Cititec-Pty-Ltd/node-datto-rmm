@@ -9,12 +9,14 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { HttpClient } from '../../src/http.js';
+import { HttpClient, parseRetryAfterMs } from '../../src/http.js';
 import { AuthManager } from '../../src/auth.js';
 import { RateLimiter } from '../../src/rate-limiter.js';
 import {
   DattoRmmError,
   DattoRmmForbiddenError,
+  DattoRmmIpBlockedError,
+  DattoRmmRateLimitError,
   DattoRmmNotFoundError,
   DattoRmmServerError,
 } from '../../src/errors.js';
@@ -181,5 +183,142 @@ describe('HttpClient response handling', () => {
       expect(err).not.toBeInstanceOf(DattoRmmForbiddenError);
       expect((err as { name: string }).name).toBe('DattoRmmIpBlockedError');
     });
+  });
+});
+
+describe('HttpClient rate-limit handling (429 is never retried)', () => {
+  beforeEach(() => {
+    vi.stubGlobal('fetch', vi.fn());
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function limited(retryAfter?: string): Response {
+    return realResponse(JSON.stringify({ message: 'Too Many Requests' }), {
+      status: 429,
+      headers: { 'content-type': 'application/json', ...(retryAfter ? { 'retry-after': retryAfter } : {}) },
+    });
+  }
+
+  it('does not retry a 429 and reports HTTP 429 with Retry-After', async () => {
+    vi.mocked(fetch).mockResolvedValue(limited('42'));
+    const err = await makeClient()
+      .request('/account/sites')
+      .catch((e: unknown) => e);
+
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(err).toBeInstanceOf(DattoRmmRateLimitError);
+    expect((err as DattoRmmRateLimitError).message).toMatch(/HTTP 429.*Try again in 42 s\./);
+    expect((err as DattoRmmRateLimitError).retryAfter).toBe(42_000);
+  });
+
+  it('reports 60 s when the 429 has no Retry-After', async () => {
+    vi.mocked(fetch).mockResolvedValue(limited());
+    const err = await makeClient()
+      .request('/account/sites')
+      .catch((e: unknown) => e);
+
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect((err as Error).message).toMatch(/HTTP 429.*Try again in 60 s\./);
+  });
+
+  it('reads a 403 after a 429 as an IP block, then refuses locally', async () => {
+    const client = makeClient();
+    vi.mocked(fetch).mockResolvedValueOnce(limited('5'));
+    await client.request('/account/sites').catch(() => undefined);
+
+    vi.mocked(fetch).mockResolvedValueOnce(
+      realResponse(JSON.stringify({ message: 'Forbidden' }), { status: 403 })
+    );
+    const blocked = await client.request('/account/sites').catch((e: unknown) => e);
+    expect(blocked).toBeInstanceOf(DattoRmmIpBlockedError);
+    expect((blocked as Error).message).toMatch(/HTTP 403.*Try again in 300 s\./);
+
+    const refused = await client.request('/account/sites').catch((e: unknown) => e);
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(refused).toBeInstanceOf(DattoRmmIpBlockedError);
+    expect((refused as Error).message).toMatch(/HTTP 403.*not sent.*Try again in \d+ s\./);
+  });
+
+  it('does not treat a rejected 2xx (HTML challenge) after a 429 as recovery', async () => {
+    const client = makeClient();
+    vi.mocked(fetch).mockResolvedValueOnce(limited('5'));
+    await client.request('/account/sites').catch(() => undefined);
+
+    vi.mocked(fetch).mockResolvedValueOnce(
+      new Response('<html>challenge</html>', { status: 200, headers: { 'content-type': 'text/html' } })
+    );
+    const challenge = await client.request('/account/sites').catch((e: unknown) => e);
+    expect(challenge).toBeInstanceOf(DattoRmmError);
+
+    vi.mocked(fetch).mockResolvedValueOnce(
+      realResponse(JSON.stringify({ message: 'Forbidden' }), { status: 403 })
+    );
+    const blocked = await client.request('/account/sites').catch((e: unknown) => e);
+    expect(blocked).toBeInstanceOf(DattoRmmIpBlockedError);
+  });
+
+  it('does not let an older request that succeeds late clear a newer 429', async () => {
+    const client = makeClient();
+    let finishOlder: (res: Response) => void = () => undefined;
+    vi.mocked(fetch).mockImplementationOnce(
+      () => new Promise<Response>((resolve) => (finishOlder = resolve))
+    );
+    const older = client.request('/account/sites');
+    // Let the older request reach fetch() before the newer one is answered.
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
+
+    vi.mocked(fetch).mockResolvedValueOnce(limited('5'));
+    await client.request('/account/devices').catch(() => undefined);
+
+    finishOlder(realResponse('[]'));
+    await expect(older).resolves.toEqual([]);
+
+    vi.mocked(fetch).mockResolvedValueOnce(
+      realResponse(JSON.stringify({ message: 'Forbidden' }), { status: 403 })
+    );
+    const blocked = await client.request('/account/sites').catch((e: unknown) => e);
+    expect(blocked).toBeInstanceOf(DattoRmmIpBlockedError);
+  });
+
+  it('treats a 403 after 429 then 200 as a plain permission error, not an IP block', async () => {
+    const client = makeClient();
+    vi.mocked(fetch).mockResolvedValueOnce(limited('5'));
+    await client.request('/account/sites').catch(() => undefined);
+
+    vi.mocked(fetch).mockResolvedValueOnce(realResponse('[]'));
+    await expect(client.request('/account/sites')).resolves.toEqual([]);
+
+    vi.mocked(fetch).mockResolvedValueOnce(
+      realResponse(JSON.stringify({ message: 'No access to this site' }), { status: 403 })
+    );
+    const err = await client.request('/account/sites').catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(DattoRmmForbiddenError);
+
+    // No local block: the next request is sent.
+    vi.mocked(fetch).mockResolvedValueOnce(realResponse('[]'));
+    await expect(client.request('/account/sites')).resolves.toEqual([]);
+    expect(fetch).toHaveBeenCalledTimes(4);
+  });
+
+  it('keeps a plain 403 without a recent 429 as DattoRmmForbiddenError', async () => {
+    vi.mocked(fetch).mockResolvedValue(realResponse(JSON.stringify({ message: 'No access' }), { status: 403 }));
+    const err = await makeClient()
+      .request('/account/sites')
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(DattoRmmForbiddenError);
+  });
+});
+
+describe('parseRetryAfterMs', () => {
+  it('reads seconds and HTTP dates, ignores junk', () => {
+    const now = Date.parse('2026-01-01T00:00:00Z');
+    expect(parseRetryAfterMs('5', now)).toBe(5000);
+    expect(parseRetryAfterMs('Thu, 01 Jan 2026 00:00:07 GMT', now)).toBe(7000);
+    expect(parseRetryAfterMs(null, now)).toBeUndefined();
+    expect(parseRetryAfterMs('soon', now)).toBeUndefined();
+    expect(parseRetryAfterMs('-3', now)).toBeUndefined();
   });
 });

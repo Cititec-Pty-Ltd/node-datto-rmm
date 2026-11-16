@@ -16,6 +16,19 @@ import {
   DattoRmmServerError,
 } from './errors.js';
 
+/** Wait reported for a 429 without Retry-After: Datto counts requests over a rolling 60 s window. */
+const DEFAULT_RATE_LIMIT_WAIT_MS = 60_000;
+
+/** Parses a Retry-After header (seconds or HTTP date) into milliseconds; undefined if absent or invalid. */
+export function parseRetryAfterMs(value: string | null, now: number = Date.now()): number | undefined {
+  if (value === null) return undefined;
+  const trimmed = value.trim();
+  if (/^\d+(\.\d+)?$/.test(trimmed)) return Math.ceil(Number(trimmed) * 1000);
+  if (!/[a-z]/i.test(trimmed)) return undefined;
+  const date = Date.parse(trimmed);
+  return Number.isNaN(date) ? undefined : Math.max(0, date - now);
+}
+
 /**
  * HTTP request options
  */
@@ -101,6 +114,9 @@ export class HttpClient {
 
     // Record the request
     this.rateLimiter.recordRequest();
+    // A success only clears the recent-429 marker if no 429 arrived after
+    // this request was sent.
+    const rateLimitGeneration = this.rateLimiter.currentRateLimitGeneration();
 
     // Make the request
     const response = await fetch(url, {
@@ -110,7 +126,16 @@ export class HttpClient {
     });
 
     // Handle the response
-    return this.handleResponse<T>(response, url, method, body, skipAuth, retryCount, isRetryAfter401);
+    return this.handleResponse<T>(
+      response,
+      url,
+      method,
+      body,
+      skipAuth,
+      retryCount,
+      isRetryAfter401,
+      rateLimitGeneration
+    );
   }
 
   /**
@@ -123,7 +148,8 @@ export class HttpClient {
     body: unknown,
     skipAuth: boolean,
     retryCount: number,
-    isRetryAfter401: boolean
+    isRetryAfter401: boolean,
+    rateLimitGeneration: number
   ): Promise<T> {
     // Read the body EXACTLY once, as text, for every path. A fetch Response
     // body is a one-shot stream: response.json() followed by response.text()
@@ -141,11 +167,15 @@ export class HttpClient {
     }
 
     if (response.ok) {
+      // Only a response we accept marks recovery from a 429. A 2xx that is
+      // rejected below (an HTML challenge or login page) does not.
       if (bodyIsJson) {
+        this.rateLimiter.handleSuccess(rateLimitGeneration);
         return parsedBody as T;
       }
       if (rawBody.trim() === '') {
         // Genuinely empty 200/204 — preserve the historical empty-object shape.
+        this.rateLimiter.handleSuccess(rateLimitGeneration);
         return {} as T;
       }
       // A 200 whose body isn't JSON is not a success we can use (login pages,
@@ -185,13 +215,16 @@ export class HttpClient {
         return this.executeRequest<T>(url, method, body, skipAuth, retryCount, true);
 
       case 403:
-        // Distinguish between IP block (rate limit) and permission denied
-        // IP blocks typically happen after persistent 429s
-        if (this.isIpBlockResponse(responseBody)) {
+        // Distinguish between IP block (rate limit) and permission denied.
+        // Datto blocks the source IP with a 403 when calls continue after a
+        // 429, so a 403 shortly after a 429 is treated as that block too.
+        if (this.isIpBlockResponse(responseBody) || this.rateLimiter.wasRecentlyRateLimited()) {
           this.rateLimiter.handleIpBlock();
+          const cooldownMs = this.config.rateLimit.ipBlockCooldownMs;
           throw new DattoRmmIpBlockedError(
-            `IP has been blocked due to rate limit violations: ${detail}`,
-            this.config.rateLimit.ipBlockCooldownMs,
+            `Datto RMM blocked this IP after rate-limit violations (HTTP 403 Forbidden). ` +
+              `Try again in ${Math.ceil(cooldownMs / 1000)} s. Detail: ${detail}`,
+            cooldownMs,
             responseBody
           );
         }
@@ -204,19 +237,20 @@ export class HttpClient {
       case 404:
         throw new DattoRmmNotFoundError(`Resource not found (404): ${detail}`, responseBody);
 
-      case 429:
-        // Rate limited - retry with backoff
-        if (this.rateLimiter.shouldRetry(retryCount)) {
-          const delay = this.rateLimiter.calculateRetryDelay(retryCount);
-          this.rateLimiter.handleRateLimitError(retryCount);
-          await this.sleep(delay);
-          return this.executeRequest<T>(url, method, body, skipAuth, retryCount + 1, isRetryAfter401);
-        }
+      case 429: {
+        // Never retried. Datto blocks the source IP (403, about 5 minutes)
+        // when requests continue after a 429, so the only safe move is to
+        // stop and report how long to wait.
+        this.rateLimiter.handleRateLimitError(retryCount);
+        const retryAfterMs = parseRetryAfterMs(response.headers.get('retry-after')) ?? DEFAULT_RATE_LIMIT_WAIT_MS;
         throw new DattoRmmRateLimitError(
-          `Rate limit exceeded and max retries reached (429): ${detail}`,
-          this.config.rateLimit.retryAfterMs,
+          `Datto RMM rate-limited the request (HTTP 429 Too Many Requests). Not retried: continuing after a 429 ` +
+            `gets this IP blocked (HTTP 403). Try again in ${Math.max(1, Math.ceil(retryAfterMs / 1000))} s. ` +
+            `Detail: ${detail}`,
+          retryAfterMs,
           responseBody
         );
+      }
 
       default:
         if (response.status >= 500) {
